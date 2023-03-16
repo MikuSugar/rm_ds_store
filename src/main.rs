@@ -3,7 +3,7 @@ use std::fs;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(author = "mikusugar", version, about="Helps delete Mac OS .DS_Stroe files", long_about = None)]
+#[command(author = "mikusugar", version, about = "Helps delete Mac OS .DS_Stroe files", long_about = None)]
 struct Args {
     #[arg(short, long)]
     path: Option<String>,
@@ -30,7 +30,7 @@ fn main() {
             Ok(path) => {
                 if path.is_file() {
                     println!("rm {:?}", path.display());
-                    fs::remove_file(path.as_path()).expect("Failed to delete file!")
+                    fs::remove_file(path.as_path()).expect(&format!("Failed to delete file {}!", path.display()))
                 }
             }
             Err(e) => eprintln!("{:?}", e),
