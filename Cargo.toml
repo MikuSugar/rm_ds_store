@@ -2,8 +2,12 @@
 name = "rm_ds_store"
 version = "0.1.0"
 edition = "2021"
+authors = ["syfangjie@live.cn"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[[bin]]
+path = "src/main.rs"
+name = 'rmds'
 
 [dependencies]
 glob = "0.3.1"
