@@ -29,7 +29,9 @@ fn main() {
         match entry {
             Ok(path) => {
                 if path.is_file() {
-                    println!("rm {:?}", path.display());
+                    if args.show {
+                        println!("rm {:?}", path.display());
+                    }
                     fs::remove_file(path.as_path()).expect(&format!("Failed to delete file {}!", path.display()))
                 }
             }
