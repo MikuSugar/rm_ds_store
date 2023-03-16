@@ -3,7 +3,7 @@ use std::fs;
 use clap::Parser;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author = "mikusugar", version, about="Helps delete Mac OS .DS_Stroe files", long_about = None)]
 struct Args {
     #[arg(short, long)]
     path: Option<String>,
