@@ -38,7 +38,7 @@ rmds -s false
 rmds --show false
 ```
 
-## uninstall
+## UNINSTALL
 ```shell
 cargo unistall rm_ds_store
 ```

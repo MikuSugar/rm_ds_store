@@ -25,12 +25,13 @@ fn main() {
     }
 
     let path = format!("{}/**/.DS_Store", path);
+    println!("Search for {} ...", path);
     for entry in glob(&path).expect(&format!("Failed to read {}", path)) {
         match entry {
             Ok(path) => {
                 if path.is_file() {
                     if args.show {
-                        println!("rm {:?}", path.display());
+                        println!("rm file {:?}", path.display());
                     }
                     fs::remove_file(path.as_path()).expect(&format!("Failed to delete file {}!", path.display()))
                 }

@@ -1,6 +1,6 @@
 [package]
 name = "rm_ds_store"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["syfangjie@live.cn"]
 description = "Command line tool to help delete Mac OS DS_Stroe files."
