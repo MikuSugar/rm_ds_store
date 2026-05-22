@@ -1,11 +1,16 @@
 use clap::Parser;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    mpsc, Arc, Condvar, Mutex,
+};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 #[command(author = "mikusugar", version, about = "Helps delete Mac OS .DS_Stroe files", long_about = None)]
@@ -73,53 +78,100 @@ fn remove_ds_store_files<W: Write>(
     out: &mut W,
     show_status: bool,
 ) -> io::Result<RemoveResult> {
-    let mut result = RemoveResult::default();
-    let mut visited = HashSet::new();
-    let mut stack = vec![root.to_path_buf()];
+    let root_metadata = fs::metadata(root)?;
+    write_status_line(out, show_status, root, 0)?;
 
-    while let Some(path) = stack.pop() {
-        write_status_line(out, show_status, &path, result.removed.len())?;
-        let metadata = fs::metadata(&path)?;
-
-        if metadata.is_file() {
-            if is_ds_store(&path) {
-                remove_ds_store_file(&path, &mut result);
-            }
-            continue;
-        }
-
-        if !metadata.is_dir() {
-            continue;
-        }
-
-        if !visited.insert(dir_id(&path, &metadata)?) {
-            continue;
-        }
-
-        for entry in fs::read_dir(&path)? {
-            let entry = entry?;
-            let entry_path = entry.path();
-            write_status_line(out, show_status, &entry_path, result.removed.len())?;
-
-            let entry_type = entry.file_type()?;
-
-            if entry_type.is_symlink() {
-                continue;
-            }
-
-            let entry_metadata = entry.metadata()?;
-
-            if entry_metadata.is_file() {
-                if is_ds_store(&entry_path) {
-                    remove_ds_store_file(&entry_path, &mut result);
-                }
-                continue;
-            }
-
-            if entry_metadata.is_dir() {
-                stack.push(entry_path);
+    let removed_count = Arc::new(AtomicUsize::new(0));
+    let delete_removed_count = Arc::clone(&removed_count);
+    let (delete_tx, delete_rx) = mpsc::channel::<PathBuf>();
+    let delete_thread = thread::spawn(move || {
+        let mut result = RemoveResult::default();
+        for path in delete_rx {
+            let removed_before = result.removed.len();
+            remove_ds_store_file(&path, &mut result);
+            if result.removed.len() > removed_before {
+                delete_removed_count.fetch_add(1, Ordering::Relaxed);
             }
         }
+        result
+    });
+
+    if root_metadata.is_file() {
+        if is_ds_store(root) {
+            send_delete(root.to_path_buf(), &delete_tx)?;
+        }
+        drop(delete_tx);
+        let result = join_delete_thread(delete_thread)?;
+        write_status_line(out, show_status, root, result.removed.len())?;
+        return Ok(result);
+    }
+
+    if !root_metadata.is_dir() {
+        drop(delete_tx);
+        let result = join_delete_thread(delete_thread)?;
+        write_status_line(out, show_status, root, result.removed.len())?;
+        return Ok(result);
+    }
+
+    let queue = Arc::new(DirQueue::new(root.to_path_buf()));
+    let visited = Arc::new(Mutex::new(HashSet::new()));
+    let first_error = Arc::new(Mutex::new(None));
+    let latest_path = Arc::new(Mutex::new(root.to_path_buf()));
+    let worker_count = traversal_thread_count();
+    let mut workers = Vec::with_capacity(worker_count);
+
+    for _ in 0..worker_count {
+        let queue = Arc::clone(&queue);
+        let visited = Arc::clone(&visited);
+        let first_error = Arc::clone(&first_error);
+        let latest_path = Arc::clone(&latest_path);
+        let delete_tx = delete_tx.clone();
+
+        workers.push(thread::spawn(move || {
+            let mut last_status_update = None;
+            while let Some(path) = queue.pop() {
+                process_directory(
+                    &path,
+                    &queue,
+                    &visited,
+                    &first_error,
+                    &latest_path,
+                    &mut last_status_update,
+                    &delete_tx,
+                );
+                queue.finish_dir();
+            }
+        }));
+    }
+
+    drop(delete_tx);
+
+    while workers.iter().any(|worker| !worker.is_finished()) {
+        let path = latest_path.lock().unwrap().clone();
+        write_status_line(
+            out,
+            show_status,
+            &path,
+            removed_count.load(Ordering::Relaxed),
+        )?;
+        thread::sleep(status_refresh_interval());
+    }
+
+    for worker in workers {
+        if worker.join().is_err() {
+            queue.close();
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "directory traversal worker panicked",
+            ));
+        }
+    }
+
+    let result = join_delete_thread(delete_thread)?;
+    write_status_line(out, show_status, root, result.removed.len())?;
+
+    if let Some(err) = first_error.lock().unwrap().take() {
+        return Err(err);
     }
 
     Ok(result)
@@ -132,6 +184,212 @@ fn remove_ds_store_file(path: &Path, result: &mut RemoveResult) {
     }
 }
 
+struct DirQueue {
+    state: Mutex<DirQueueState>,
+    available: Condvar,
+}
+
+struct DirQueueState {
+    dirs: VecDeque<PathBuf>,
+    active: usize,
+    done: bool,
+}
+
+impl DirQueue {
+    fn new(root: PathBuf) -> Self {
+        let mut dirs = VecDeque::new();
+        dirs.push_back(root);
+
+        Self {
+            state: Mutex::new(DirQueueState {
+                dirs,
+                active: 0,
+                done: false,
+            }),
+            available: Condvar::new(),
+        }
+    }
+
+    fn pop(&self) -> Option<PathBuf> {
+        let mut state = self.state.lock().unwrap();
+
+        loop {
+            if let Some(path) = state.dirs.pop_front() {
+                state.active += 1;
+                return Some(path);
+            }
+
+            if state.done {
+                return None;
+            }
+
+            state = self.available.wait(state).unwrap();
+        }
+    }
+
+    fn push(&self, path: PathBuf) {
+        let mut state = self.state.lock().unwrap();
+        if state.done {
+            return;
+        }
+
+        state.dirs.push_back(path);
+        self.available.notify_one();
+    }
+
+    fn finish_dir(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.active -= 1;
+
+        if state.active == 0 && state.dirs.is_empty() {
+            state.done = true;
+            self.available.notify_all();
+        }
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.done = true;
+        self.available.notify_all();
+    }
+}
+
+fn process_directory(
+    path: &Path,
+    queue: &DirQueue,
+    visited: &Mutex<HashSet<(u64, u64)>>,
+    first_error: &Mutex<Option<io::Error>>,
+    latest_path: &Mutex<PathBuf>,
+    last_status_update: &mut Option<Instant>,
+    delete_tx: &mpsc::Sender<PathBuf>,
+) {
+    maybe_update_latest_path(latest_path, path, last_status_update);
+
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) => {
+            set_traversal_error(err, first_error, queue);
+            return;
+        }
+    };
+
+    if !metadata.is_dir() {
+        return;
+    }
+
+    let id = match dir_id(path, &metadata) {
+        Ok(id) => id,
+        Err(err) => {
+            set_traversal_error(err, first_error, queue);
+            return;
+        }
+    };
+
+    if !visited.lock().unwrap().insert(id) {
+        return;
+    }
+
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(err) => {
+            set_traversal_error(err, first_error, queue);
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                set_traversal_error(err, first_error, queue);
+                return;
+            }
+        };
+        let entry_path = entry.path();
+        maybe_update_latest_path(latest_path, &entry_path, last_status_update);
+
+        let entry_type = match entry.file_type() {
+            Ok(entry_type) => entry_type,
+            Err(err) => {
+                set_traversal_error(err, first_error, queue);
+                return;
+            }
+        };
+
+        if entry_type.is_symlink() {
+            continue;
+        }
+
+        let entry_metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(err) => {
+                set_traversal_error(err, first_error, queue);
+                return;
+            }
+        };
+
+        if entry_metadata.is_file() {
+            if is_ds_store(&entry_path) && send_delete(entry_path, delete_tx).is_err() {
+                set_traversal_error(
+                    io::Error::new(io::ErrorKind::BrokenPipe, "delete worker stopped"),
+                    first_error,
+                    queue,
+                );
+                return;
+            }
+            continue;
+        }
+
+        if entry_metadata.is_dir() {
+            queue.push(entry_path);
+        }
+    }
+}
+
+fn maybe_update_latest_path(
+    latest_path: &Mutex<PathBuf>,
+    path: &Path,
+    last_status_update: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    if last_status_update.map_or(true, |last| {
+        now.duration_since(last) >= status_refresh_interval()
+    }) {
+        *latest_path.lock().unwrap() = path.to_path_buf();
+        *last_status_update = Some(now);
+    }
+}
+
+fn status_refresh_interval() -> Duration {
+    Duration::from_millis(50)
+}
+
+fn set_traversal_error(err: io::Error, first_error: &Mutex<Option<io::Error>>, queue: &DirQueue) {
+    let mut first_error = first_error.lock().unwrap();
+    if first_error.is_none() {
+        *first_error = Some(err);
+    }
+    queue.close();
+}
+
+fn send_delete(path: PathBuf, delete_tx: &mpsc::Sender<PathBuf>) -> io::Result<()> {
+    delete_tx
+        .send(path)
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "delete worker stopped"))
+}
+
+fn join_delete_thread(delete_thread: thread::JoinHandle<RemoveResult>) -> io::Result<RemoveResult> {
+    delete_thread
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "delete worker panicked"))
+}
+
+fn traversal_thread_count() -> usize {
+    thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(4)
+}
+
 fn write_status_line<W: Write>(
     out: &mut W,
     show_status: bool,
@@ -142,7 +400,7 @@ fn write_status_line<W: Write>(
         return Ok(());
     }
 
-    let status = format!("Searching: {} | deleted: {}", path.display(), count);
+    let status = format!("deleted: {} | Searching: {}", count, path.display());
     write!(out, "\r\x1b[2K{}", fit_status_line(&status))?;
     out.flush()
 }
@@ -206,6 +464,46 @@ mod tests {
         assert_eq!(result.removed.len(), 2);
         assert!(!root.join(".DS_Store").exists());
         assert!(!nested.join(".DS_Store").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deletes_ds_store_files_across_independent_subtrees() {
+        let root = test_dir("rm_ds_store_parallel");
+        let left = root.join("left").join("deep");
+        let right = root.join("right").join("deep");
+        fs::create_dir_all(&left).unwrap();
+        fs::create_dir_all(&right).unwrap();
+        fs::write(root.join(".DS_Store"), b"root").unwrap();
+        fs::write(left.join(".DS_Store"), b"left").unwrap();
+        fs::write(right.join(".DS_Store"), b"right").unwrap();
+        fs::write(right.join("notes.txt"), b"keep").unwrap();
+
+        let result = remove_ds_store_files(&root, &mut io::sink(), false).unwrap();
+
+        assert_eq!(result.removed.len(), 3);
+        assert_eq!(result.failed.len(), 0);
+        assert!(!root.join(".DS_Store").exists());
+        assert!(!left.join(".DS_Store").exists());
+        assert!(!right.join(".DS_Store").exists());
+        assert!(right.join("notes.txt").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deletes_root_ds_store_file() {
+        let root = test_dir("rm_ds_store_root_file");
+        fs::create_dir_all(&root).unwrap();
+        let ds_store = root.join(".DS_Store");
+        fs::write(&ds_store, b"root file").unwrap();
+
+        let result = remove_ds_store_files(&ds_store, &mut io::sink(), false).unwrap();
+
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(result.failed.len(), 0);
+        assert!(!ds_store.exists());
 
         fs::remove_dir_all(root).unwrap();
     }
