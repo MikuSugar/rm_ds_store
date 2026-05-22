@@ -15,7 +15,5 @@ jobs:
       - name: publish
         run: |
           # publish
-          cargo login $CARGO_REGISTRY_TOKEN
           cargo package
           cargo publish
-

@@ -5,6 +5,9 @@ edition = "2021"
 authors = ["syfangjie@live.cn"]
 description = "Command line tool to help delete Mac OS DS_Stroe files."
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/MikuSugar/rm_ds_store"
+homepage = "https://github.com/MikuSugar/rm_ds_store"
+documentation = "https://docs.rs/rm_ds_store"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [[bin]]
