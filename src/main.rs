@@ -267,6 +267,7 @@ fn process_directory(
 
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
+        Err(err) if should_skip_traversal_error(&err) => return,
         Err(err) => {
             set_traversal_error(err, first_error, queue);
             return;
@@ -279,6 +280,7 @@ fn process_directory(
 
     let id = match dir_id(path, &metadata) {
         Ok(id) => id,
+        Err(err) if should_skip_traversal_error(&err) => return,
         Err(err) => {
             set_traversal_error(err, first_error, queue);
             return;
@@ -291,6 +293,7 @@ fn process_directory(
 
     let entries = match fs::read_dir(path) {
         Ok(entries) => entries,
+        Err(err) if should_skip_traversal_error(&err) => return,
         Err(err) => {
             set_traversal_error(err, first_error, queue);
             return;
@@ -300,6 +303,7 @@ fn process_directory(
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
+            Err(err) if should_skip_traversal_error(&err) => continue,
             Err(err) => {
                 set_traversal_error(err, first_error, queue);
                 return;
@@ -310,6 +314,7 @@ fn process_directory(
 
         let entry_type = match entry.file_type() {
             Ok(entry_type) => entry_type,
+            Err(err) if should_skip_traversal_error(&err) => continue,
             Err(err) => {
                 set_traversal_error(err, first_error, queue);
                 return;
@@ -322,6 +327,7 @@ fn process_directory(
 
         let entry_metadata = match entry.metadata() {
             Ok(metadata) => metadata,
+            Err(err) if should_skip_traversal_error(&err) => continue,
             Err(err) => {
                 set_traversal_error(err, first_error, queue);
                 return;
@@ -344,6 +350,10 @@ fn process_directory(
             queue.push(entry_path);
         }
     }
+}
+
+fn should_skip_traversal_error(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::PermissionDenied
 }
 
 fn maybe_update_latest_path(
@@ -446,6 +456,7 @@ fn dir_id(_path: &Path, metadata: &fs::Metadata) -> io::Result<(u64, u64)> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -504,6 +515,34 @@ mod tests {
         assert_eq!(result.removed.len(), 1);
         assert_eq!(result.failed.len(), 0);
         assert!(!ds_store.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn skips_directories_without_permission() {
+        let root = test_dir("rm_ds_store_permission_denied");
+        let readable = root.join("readable");
+        let blocked = root.join("blocked");
+        fs::create_dir_all(&readable).unwrap();
+        fs::create_dir_all(&blocked).unwrap();
+        fs::write(readable.join(".DS_Store"), b"readable").unwrap();
+        fs::write(blocked.join(".DS_Store"), b"blocked").unwrap();
+
+        let original_permissions = fs::metadata(&blocked).unwrap().permissions();
+        let mut blocked_permissions = original_permissions.clone();
+        blocked_permissions.set_mode(0o000);
+        fs::set_permissions(&blocked, blocked_permissions).unwrap();
+
+        let result = remove_ds_store_files(&root, &mut io::sink(), false);
+
+        fs::set_permissions(&blocked, original_permissions).unwrap();
+        let result = result.unwrap();
+
+        assert_eq!(result.removed.len(), 1);
+        assert_eq!(result.failed.len(), 0);
+        assert!(!readable.join(".DS_Store").exists());
+        assert!(blocked.join(".DS_Store").exists());
 
         fs::remove_dir_all(root).unwrap();
     }
